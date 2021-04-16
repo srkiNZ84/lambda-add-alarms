@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 
@@ -10,65 +11,78 @@ import (
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/lambda/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 func main() {
-	fmt.Println("Starting Go AWS client")
-	// TODO Make the profile able to be passed in through ENV vars
+	awsProfile := flag.String("profile", "", "The AWS profile to use when querying Lambdas and creating CloudWatch alarms.")
+	devEnvName := flag.String("devenv", "dev", "The name of the environment to use for tags and SNS topics. Defaults to 'dev'.")
+	awsRegion := flag.String("region", "ap-southeast-2", "The name of the AWS Region to search for Lambdas and CloudWatch alarms in")
+
+	flag.Parse()
+
+	if *awsProfile == "" {
+		log.Fatalf("AWS Profile needs to be set using the '-profile' option")
+	}
+
+	fmt.Println("Starting Go AWS client, using profile", *awsProfile)
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithRegion("ap-southeast-2"),
-		config.WithSharedConfigProfile("AWS-PROFILE-DEV"),
+		config.WithRegion(*awsRegion),
+		config.WithSharedConfigProfile(*awsProfile),
 	)
 
 	if err != nil {
-		log.Fatalf("Unable to load config, %v", err)
+		log.Fatalf("Unable to load AWS config, %v", err)
 	}
+
+	stsSvc := sts.NewFromConfig(cfg)
+	awsId, err := stsSvc.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
+	if err != nil {
+		log.Fatalf("Unable to get the AWS account ID, %v", err)
+	}
+
 	lambdaSvc := lambda.NewFromConfig(cfg)
 
-	l := getLambdas(lambdaSvc)
+	l := getLambdas(lambdaSvc, *devEnvName)
 
-	log.Println("List of functions:")
-	for _, function := range l {
-		log.Printf("Function name is %s", *function.FunctionName)
-	}
+	log.Printf("Found %v Lambda functions", len(l))
 
 	// Get list of CloudWatch alarms
 	cwSvc := cloudwatch.NewFromConfig(cfg)
-	a := getAlarmsMap(cwSvc)
+	cwa := getAlarmsMap(cwSvc)
 
-	for a, _ := range a {
-		log.Printf("Found Metric alarm %s", a)
-	}
+	log.Printf("Found %v CloudWatch Metric alarms", len(cwa))
 
 	for _, lf := range l {
-		if _, exists := a[*lf.FunctionName+"-alarm"]; exists {
-			log.Printf("Function %s already has a CloudWatch alarm", *lf.FunctionName)
+		if _, exists := cwa[*lf.FunctionName+"-errors-alarm"]; exists {
+			log.Printf("Function %s already has a CloudWatch alarm, skipping", *lf.FunctionName)
 		} else {
-			log.Printf("Function name %s does NOT have a CloudWatch alarm, need to create one", *lf.FunctionName)
+			log.Printf("Function name %s does NOT have a CloudWatch alarm, need to create one...", *lf.FunctionName)
 
 			// TODO Need to make sure that the name of the alarm doesn't exceed the AWS max name limit
-			alarmName := fmt.Sprintf("%s%s", *lf.FunctionName, "-alarm")
-			ep := int32(2)
-			d := fmt.Sprintf("Automatically generated alarm for %s function", *lf.FunctionName)
+			alarmName := fmt.Sprintf("%s%s", *lf.FunctionName, "-errors-alarm")
+			ep := int32(1)
+			d := fmt.Sprintf("Automatically generated alarm for %s function errors", *lf.FunctionName)
 			dk := "FunctionName"
 			m := "Errors"
 			ns := "AWS/Lambda"
-			p := int32(120)
-			t := float64(5)
+			p := int32(60)
+			t := float64(1)
 			tk := "Environment"
-			tv := "Dev"
+			tkcb := "CreatedBy"
+			tvcb := "lambda-add-alarms"
 			pai := &cloudwatch.PutMetricAlarmInput{
 				AlarmName:          &alarmName,
 				ComparisonOperator: cwtypes.ComparisonOperatorGreaterThanOrEqualToThreshold,
 				EvaluationPeriods:  &ep,
-				AlarmActions:       []string{"arn:aws:sns:ap-southeast-2:1111111111111111111:foo-bar-dev-alarms"},
+				AlarmActions:       []string{"arn:aws:sns:" + *awsRegion + ":" + *awsId.Account + ":" + *devEnvName + "-advice-online-alarms"},
 				AlarmDescription:   &d,
 				Dimensions:         []cwtypes.Dimension{{Name: &dk, Value: lf.FunctionName}},
 				MetricName:         &m,
 				Namespace:          &ns,
 				Period:             &p,
 				Statistic:          cwtypes.StatisticSum,
-				Tags:               []cwtypes.Tag{{Key: &tk, Value: &tv}},
+				Tags:               []cwtypes.Tag{{Key: &tk, Value: devEnvName}, {Key: &tkcb, Value: &tvcb}},
 				Threshold:          &t,
 			}
 			_, err := cwSvc.PutMetricAlarm(context.TODO(), pai)
@@ -76,12 +90,8 @@ func main() {
 				log.Fatalf("Unable to create alarm for function %s. \nError: %v", *lf.FunctionName, err)
 
 			}
-
 		}
 	}
-
-	// TODO For each lambda function check if alarm exists
-	// TODO If no alarm exists, create one
 }
 
 func getAlarmsMap(c *cloudwatch.Client) map[string]bool {
@@ -94,21 +104,38 @@ func getAlarmsMap(c *cloudwatch.Client) map[string]bool {
 }
 
 func getAlarms(c *cloudwatch.Client) []cwtypes.MetricAlarm {
-	// TODO Add pagination to make sure we get the full list
-	a, err := c.DescribeAlarms(context.TODO(), &cloudwatch.DescribeAlarmsInput{})
-	if err != nil {
-		log.Fatalf("Unable to describe alarms, %v", err)
+	cwa := []cwtypes.MetricAlarm{}
+	ap := cloudwatch.NewDescribeAlarmsPaginator(c, &cloudwatch.DescribeAlarmsInput{})
+	for ap.HasMorePages() {
+		a, err := ap.NextPage(context.TODO())
+		if err != nil {
+			log.Fatalf("Unable to describe alarms, %v", err)
+		}
+		cwa = append(cwa, a.MetricAlarms...)
 	}
-	return a.MetricAlarms
+	return cwa
 }
 
-func getLambdas(l *lambda.Client) []types.FunctionConfiguration {
-	// TODO Add pagination to get the full list for sure
-	// TODO Add optional argument to get only functions with a particular tag (e.g. Environment = DEV)
-	response, err := l.ListFunctions(context.TODO(), &lambda.ListFunctionsInput{})
-	if err != nil {
-		log.Fatalf("Unable to list functions, %v", err)
+func getLambdas(l *lambda.Client, envTag string) []types.FunctionConfiguration {
+	lf := []types.FunctionConfiguration{}
+	lp := lambda.NewListFunctionsPaginator(l, &lambda.ListFunctionsInput{})
+	for lp.HasMorePages() {
+		response, err := lp.NextPage(context.TODO())
+		if err != nil {
+			log.Fatalf("Unable to list functions, %v", err)
+		}
+		for _, lamFunc := range response.Functions {
+			ts, err := l.ListTags(context.TODO(), &lambda.ListTagsInput{Resource: lamFunc.FunctionArn})
+			if err != nil {
+				log.Fatalf("Unable to get tags for function %s, error: %v", *lamFunc.FunctionArn, err)
+			}
+			for tn, v := range ts.Tags {
+				if tn == "STAGE" && v == envTag {
+					//log.Printf("Adding function %s because tag %s with value %s matches", *lamFunc.FunctionName, tn, v)
+					lf = append(lf, lamFunc)
+				}
+			}
+		}
 	}
-
-	return response.Functions
+	return lf
 }
